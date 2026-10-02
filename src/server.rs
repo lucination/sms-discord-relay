@@ -12,6 +12,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tracing::Instrument;
 
 pub struct App {
     key: SigningKey,
@@ -55,13 +56,50 @@ async fn bounded(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Ok(_permit) = app.slots.try_acquire() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let route = match request.uri().path() {
+        "/healthz" => "health",
+        "/transform" => "transform",
+        "/webhook" => "webhook",
+        _ => "other",
     };
-    match tokio::time::timeout(app.budget, next.run(request)).await {
-        Ok(response) => response,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let span = if route == "health" {
+        tracing::debug_span!("request", route)
+    } else {
+        tracing::info_span!("request", route)
+    };
+    async {
+        let start = std::time::Instant::now();
+        let (response, outcome) = if let Ok(_permit) = app.slots.try_acquire() {
+            match tokio::time::timeout(app.budget, next.run(request)).await {
+                Ok(response) => {
+                    let outcome = match response.status() {
+                        StatusCode::UNAUTHORIZED => "unauthorized",
+                        StatusCode::PAYLOAD_TOO_LARGE => "limit",
+                        StatusCode::BAD_REQUEST => "invalid",
+                        StatusCode::BAD_GATEWAY => "upstream_failure",
+                        StatusCode::SERVICE_UNAVAILABLE => "unavailable",
+                        StatusCode::NOT_FOUND => "not_found",
+                        StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+                        _ => "complete",
+                    };
+                    (response, outcome)
+                }
+                Err(_) => (StatusCode::SERVICE_UNAVAILABLE.into_response(), "timeout"),
+            }
+        } else {
+            (StatusCode::SERVICE_UNAVAILABLE.into_response(), "overload")
+        };
+        let status = response.status().as_u16();
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        if route == "health" {
+            tracing::debug!(event = "request", route, status, elapsed_ms, outcome);
+        } else {
+            tracing::info!(event = "request", route, status, elapsed_ms, outcome);
+        }
+        response
     }
+    .instrument(span)
+    .await
 }
 fn authenticate(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(), StatusCode> {
     let unauthorized = StatusCode::UNAUTHORIZED;
@@ -100,6 +138,20 @@ async fn transform_http(State(app): State<Arc<App>>, headers: HeaderMap, body: B
         Err(status) => status.into_response(),
     }
 }
+enum ForwardReason {
+    Accepted,
+    UpstreamStatus,
+    Transport,
+}
+impl ForwardReason {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::UpstreamStatus => "upstream_status",
+            Self::Transport => "transport",
+        }
+    }
+}
 async fn webhook_http(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
     let payloads = match parse(&app, &headers, &body) {
         Ok(Delivery::Single(payload)) => vec![payload],
@@ -110,7 +162,8 @@ async fn webhook_http(State(app): State<Arc<App>>, headers: HeaderMap, body: Byt
     let Some(target) = &app.target else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    for payload in payloads {
+    let total = payloads.len();
+    for (index, payload) in payloads.into_iter().enumerate() {
         match app
             .client
             .post(target.0.clone())
@@ -118,8 +171,36 @@ async fn webhook_http(State(app): State<Arc<App>>, headers: HeaderMap, body: Byt
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => {}
-            _ => return StatusCode::BAD_GATEWAY.into_response(),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if response.status().is_success() {
+                    tracing::info!(
+                        event = "forward",
+                        status,
+                        total,
+                        completed = index + 1,
+                        reason = ForwardReason::Accepted.label()
+                    );
+                } else {
+                    tracing::warn!(
+                        event = "forward",
+                        status,
+                        total,
+                        completed = index,
+                        reason = ForwardReason::UpstreamStatus.label()
+                    );
+                    return StatusCode::BAD_GATEWAY.into_response();
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    event = "forward",
+                    total,
+                    completed = index,
+                    reason = ForwardReason::Transport.label()
+                );
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
         }
     }
     StatusCode::NO_CONTENT.into_response()
@@ -164,6 +245,7 @@ impl DiscordTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::instrument::WithSubscriber;
     #[tokio::test]
     async fn accepts_exact_body_boundary_and_rejects_chunked_overflow() {
         let relay = serve(
@@ -381,7 +463,7 @@ mod tests {
                 signed(
                     &client,
                     url.clone(),
-                    r#"{"event":"sms:received","payload":{}}"#
+                    r#"{"event":"sms:received","payload":{"message":null}}"#
                 )
                 .send()
                 .await
@@ -520,6 +602,117 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarding_logs_safe_counts_and_upstream_status() {
+        for status in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+            let capture = LogCapture::default();
+            let sink = capture.clone();
+            let subscriber = crate::logging::subscriber(Some("trace"), move || sink.clone());
+            async {
+                let discord = serve(Router::new().route(
+                    "/",
+                    post(move || async move { (status, "UPSTREAM_BODY_SECRET") }),
+                ))
+                .await;
+                let client = reqwest::Client::new();
+                let sms = SMS
+                    .replace("hello", "BODY_SECRET")
+                    .replace("+123", "SENDER_SECRET");
+                let request = signed(
+                    &client,
+                    "http://localhost/webhook?QUERY_SECRET".into(),
+                    &sms,
+                )
+                .build()
+                .unwrap();
+                let response = webhook_http(
+                    State(Arc::new(mock_app(&discord.base))),
+                    request.headers().clone(),
+                    Bytes::from(sms),
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    if status.is_success() {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    }
+                );
+            }
+            .with_subscriber(subscriber)
+            .await;
+            let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains("event=\"forward\""), "{logs}");
+            assert!(
+                logs.contains(&format!("status={}", status.as_u16())),
+                "{logs}"
+            );
+            assert!(logs.contains("total=1"), "{logs}");
+            assert!(
+                logs.contains(if status.is_success() {
+                    "completed=1"
+                } else {
+                    "completed=0"
+                }),
+                "{logs}"
+            );
+            assert!(
+                logs.contains(if status.is_success() {
+                    "reason=\"accepted\""
+                } else {
+                    "reason=\"upstream_status\""
+                }),
+                "{logs}"
+            );
+            assert!(!logs.contains("SECRET"), "{logs}");
+            assert!(!logs.contains("http://"), "{logs}");
+            assert!(!logs.contains("test-key"), "{logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarding_logs_transport_failure_without_raw_error() {
+        let capture = LogCapture::default();
+        let sink = capture.clone();
+        let subscriber = crate::logging::subscriber(Some("trace"), move || sink.clone());
+        async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}/TOKEN_SECRET", listener.local_addr().unwrap());
+            drop(listener);
+            let client = reqwest::Client::new();
+            let request = signed(&client, "http://localhost/webhook".into(), SMS)
+                .build()
+                .unwrap();
+            let response = webhook_http(
+                State(Arc::new(mock_app(&base))),
+                request.headers().clone(),
+                Bytes::from_static(SMS.as_bytes()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("reason=\"transport\""), "{logs}");
+        assert!(logs.contains("completed=0"), "{logs}");
+        assert!(!logs.contains("SECRET"), "{logs}");
+        assert!(!logs.contains("http://"), "{logs}");
+    }
+
     #[tokio::test]
     async fn forwards_to_local_discord_with_wait_and_safe_payload() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -545,7 +738,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let (uri, payload) = rx.recv().await.unwrap();
         assert_eq!(uri.query(), Some("wait=true"));
-        assert!(payload["content"].as_str().unwrap().contains("From: +123"));
+        assert!(
+            payload["content"]
+                .as_str()
+                .unwrap()
+                .contains("📱 **New SMS from +123**")
+        );
         assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
     }
 
@@ -566,7 +764,7 @@ mod tests {
             .unwrap();
         app
     }
-    const SMS: &str = r#"{"event":"sms:received","payload":{"sender":"+123","message":"hello","recipient":null,"simNumber":1,"receivedAt":"now"}}"#;
+    const SMS: &str = r#"{"event":"sms:received","deviceId":"device","id":"delivery","webhookId":"hook","scheme":"https","payload":{"messageId":"message","phoneNumber":"legacy","sender":"+123","message":"hello","recipient":null,"simNumber":1,"receivedAt":"now"}}"#;
     struct TestServer {
         base: String,
         task: tokio::task::JoinHandle<()>,
@@ -579,9 +777,12 @@ mod tests {
     async fn serve(router: Router) -> TestServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
+        let task = tokio::spawn(
+            async move {
+                axum::serve(listener, router).await.unwrap();
+            }
+            .with_current_subscriber(),
+        );
         TestServer { base, task }
     }
     fn signed(client: &reqwest::Client, url: String, body: &str) -> reqwest::RequestBuilder {

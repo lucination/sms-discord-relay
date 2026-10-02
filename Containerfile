@@ -9,7 +9,7 @@ COPY src ./src
 RUN cargo build --locked --release
 
 FROM scratch
-ARG VERSION=0.1.0
+ARG VERSION=0.1.1
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="sms-discord-relay"       org.opencontainers.image.description="Authenticated Android SMS Gateway to Discord webhook relay"       org.opencontainers.image.source="https://github.com/lucination/sms-discord-relay"       org.opencontainers.image.version="${VERSION}"       org.opencontainers.image.revision="${REVISION}"
 COPY --from=build /build/target/release/sms-discord-relay /sms-discord-relay

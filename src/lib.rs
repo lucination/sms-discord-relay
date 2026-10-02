@@ -1,3 +1,4 @@
+pub mod logging;
 pub mod server;
 use serde::Serialize;
 
@@ -57,14 +58,17 @@ pub enum InputError {
 }
 #[derive(serde::Deserialize)]
 struct Sms {
-    #[serde(alias = "phoneNumber")]
-    sender: String,
+    sender: Option<String>,
+    #[serde(rename = "phoneNumber")]
+    phone_number: Option<String>,
+    #[serde(default)]
     message: String,
-    recipient: Option<String>,
+    #[serde(rename = "recipient")]
+    _recipient: Option<String>,
     #[serde(rename = "simNumber")]
-    sim_number: Option<u32>,
-    #[serde(rename = "receivedAt")]
-    received_at: String,
+    _sim_number: Option<u32>,
+    #[serde(default, rename = "receivedAt")]
+    received_at: Option<String>,
 }
 fn truncate(text: &str, max: usize) -> String {
     if text.encode_utf16().count() <= max {
@@ -82,25 +86,25 @@ fn truncate(text: &str, max: usize) -> String {
     result.push('…');
     result
 }
-fn render(sms: Sms) -> DiscordPayload {
-    let sms = Sms {
-        sender: truncate(&sms.sender, 160),
-        recipient: sms.recipient.map(|s| truncate(&s, 160)),
-        received_at: truncate(&sms.received_at, 160),
-        ..sms
-    };
-    let mut content = format!("From: {}\n", sms.sender);
-    if let Some(recipient) = sms.recipient {
-        content.push_str(&format!("To: {recipient}\n"));
+fn render(sms: Sms) -> Result<DiscordPayload, InputError> {
+    if sms.sender.is_none() && sms.phone_number.is_none() {
+        return Err(InputError::Invalid);
     }
-    if let Some(sim) = sms.sim_number {
-        content.push_str(&format!("SIM: {sim}\n"));
+    let sender = sms
+        .sender
+        .as_deref()
+        .or(sms.phone_number.as_deref())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown sender");
+    let received_at = sms.received_at.as_deref().unwrap_or("");
+    let mut content = format!("📱 **New SMS from {sender}**\n{}", sms.message);
+    if !received_at.is_empty() {
+        content.push_str(&format!("\n-# {received_at}"));
     }
-    content.push_str(&format!("Received: {}\n\n{}", sms.received_at, sms.message));
-    DiscordPayload {
+    Ok(DiscordPayload {
         content: truncate(&content, 2000),
         allowed_mentions: AllowedMentions { parse: [] },
-    }
+    })
 }
 pub fn transform(body: &[u8]) -> Result<Delivery, InputError> {
     #[derive(serde::Deserialize)]
@@ -121,12 +125,12 @@ pub fn transform(body: &[u8]) -> Result<Delivery, InputError> {
     }
     let event: Envelope = serde_json::from_slice(body).map_err(|_| InputError::Invalid)?;
     Ok(match event {
-        Envelope::Single(sms) => Delivery::Single(render(sms)),
+        Envelope::Single(sms) => Delivery::Single(render(sms)?),
         Envelope::Batch { messages } => {
             if messages.len() > 100 {
                 return Err(InputError::TooMany);
             }
-            Delivery::Batch(messages.into_iter().map(render).collect())
+            Delivery::Batch(messages.into_iter().map(render).collect::<Result<_, _>>()?)
         }
     })
 }
@@ -134,6 +138,63 @@ pub fn transform(body: &[u8]) -> Result<Delivery, InputError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepts_current_delivery_with_both_sender_fields() {
+        for (sender, expected) in [
+            (serde_json::json!("current"), "current"),
+            (serde_json::Value::Null, "legacy"),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "event": "sms:received", "deviceId":"device", "id":"delivery", "webhookId":"hook", "scheme":"https",
+                "payload":{"messageId":"message", "message":"text", "phoneNumber":"legacy", "sender":sender,
+                    "recipient":null, "simNumber":1, "receivedAt":"now"}
+            })).unwrap();
+            let Delivery::Single(payload) = transform(&body).unwrap() else {
+                panic!()
+            };
+            assert_eq!(
+                payload.content,
+                format!("📱 **New SMS from {expected}**\ntext\n-# now")
+            );
+        }
+    }
+    #[test]
+    fn rejects_missing_sender_fields_in_single_and_batch() {
+        for payload in [
+            serde_json::json!({"message":"text"}),
+            serde_json::json!({"sender":null,"phoneNumber":null}),
+        ] {
+            for body in [
+                serde_json::json!({"event":"sms:received","payload":payload.clone()}),
+                serde_json::json!({"event":"sms:batch:received","payload":{"messages":[{"sender":"valid"},payload.clone()]}}),
+            ] {
+                assert_eq!(
+                    transform(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
+                    InputError::Invalid
+                );
+            }
+        }
+    }
+    #[test]
+    fn python_format_defaults_and_optional_footer() {
+        for payload in [
+            serde_json::json!({"sender":""}),
+            serde_json::json!({"sender":"","receivedAt":null}),
+            serde_json::json!({"sender":"","receivedAt":"","message":""}),
+        ] {
+            let body =
+                serde_json::to_vec(&serde_json::json!({"event":"sms:received","payload":payload}))
+                    .unwrap();
+            let Delivery::Single(p) = transform(&body).unwrap() else {
+                panic!()
+            };
+            assert_eq!(p.content, "📱 **New SMS from unknown sender**\n");
+        }
+        assert_eq!(
+            transform(br#"{"event":"sms:received","payload":{"message":null}}"#).unwrap_err(),
+            InputError::Invalid
+        );
+    }
     #[test]
     fn rejects_empty_key_and_expired_timestamp() {
         use hmac::{Hmac, Mac};
@@ -181,14 +242,14 @@ mod tests {
     }
 
     #[test]
-    fn truncates_unicode_including_labels_without_losing_message_to_long_sender() {
+    fn truncates_whole_content_at_utf16_scalar_boundary() {
         let body=serde_json::to_vec(&serde_json::json!({"event":"sms:received","payload":{
             "sender":"s".repeat(4000),"recipient":"r".repeat(4000),"receivedAt":"t".repeat(4000),"message":"😀".repeat(3000)}})).unwrap();
         let Delivery::Single(p) = transform(&body).unwrap() else {
             panic!()
         };
         assert!(p.content.encode_utf16().count() <= 2000);
-        assert!(p.content.contains("😀"));
+        assert!(p.content.starts_with("📱 **New SMS from "));
         assert!(p.content.ends_with('…'));
     }
 
@@ -214,19 +275,19 @@ mod tests {
         ));
         assert_eq!(transform(b"not JSON").unwrap_err(), InputError::Invalid);
         assert_eq!(
-            transform(br#"{"event":"sms:received","payload":{}}"#).unwrap_err(),
+            transform(br#"{"event":"sms:received","payload":{"message":42}}"#).unwrap_err(),
             InputError::Invalid
         );
     }
 
     #[test]
-    fn legacy_batch_preserves_recipient() {
+    fn legacy_batch_uses_sender_without_recipient_label() {
         let body = br#"{"event":"sms:batch:received","payload":{"messages":[{"phoneNumber":"old","message":"text","recipient":"me","simNumber":null,"receivedAt":"now"}]}}"#;
         let Delivery::Batch(payloads) = transform(body).unwrap() else {
             panic!("batch expected")
         };
         assert_eq!(payloads.len(), 1);
-        assert!(payloads[0].content.contains("From: old\nTo: me"));
+        assert_eq!(payloads[0].content, "📱 **New SMS from old**\ntext\n-# now");
     }
     #[test]
     fn current_sms_becomes_safe_discord_payload() {
@@ -234,10 +295,10 @@ mod tests {
         let Delivery::Single(payload) = transform(body).unwrap() else {
             panic!("single expected")
         };
-        assert!(payload.content.contains("From: +123"));
-        assert!(payload.content.contains("hello @everyone"));
-        assert!(payload.content.contains("2024-06-22T15:46:11.000+07:00"));
-        assert!(payload.content.contains("SIM: 1"));
+        assert_eq!(
+            payload.content,
+            "📱 **New SMS from +123**\nhello @everyone\n-# 2024-06-22T15:46:11.000+07:00"
+        );
         assert_eq!(
             serde_json::to_value(payload).unwrap()["allowed_mentions"]["parse"],
             serde_json::json!([])

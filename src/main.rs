@@ -27,6 +27,15 @@ async fn run() -> Result<(), &'static str> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|_| "HTTP listener bind failed")?;
+    let listen = listener
+        .local_addr()
+        .map_err(|_| "HTTP listener address failed")?;
+    let mode = if std::env::var_os("DISCORD_WEBHOOK_URL").is_some() {
+        "forward"
+    } else {
+        "transform"
+    };
+    tracing::info!(event = "startup", %listen, mode);
     axum::serve(listener, app.router())
         .with_graceful_shutdown(shutdown())
         .await
@@ -39,17 +48,20 @@ async fn shutdown() {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
             tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+            tracing::info!(event = "shutdown");
             return;
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+    tracing::info!(event = "shutdown");
 }
 #[tokio::main]
 async fn main() -> ExitCode {
+    sms_discord_relay::logging::init();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("{message}");
+            tracing::error!(event = "startup_failure", reason = message);
             ExitCode::FAILURE
         }
     }

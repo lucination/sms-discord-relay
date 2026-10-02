@@ -17,6 +17,8 @@ async fn executable_serves_signed_transform_on_real_listener() {
             .env("SMS_GATEWAY_SIGNING_KEY", "test-key")
             .env_remove("DISCORD_WEBHOOK_URL")
             .env("BIND_ADDR", address.to_string())
+            .env_remove("RUST_LOG")
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap(),
     );
@@ -45,7 +47,7 @@ async fn executable_serves_signed_transform_on_real_listener() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     use hmac::{Hmac, Mac};
-    let body = r#"{"event":"sms:received","payload":{"sender":"x","message":"actual executable","receivedAt":"now"}}"#;
+    let body = r#"{"event":"sms:received","payload":{"sender":"x","phoneNumber":"legacy","message":"actual executable","receivedAt":"now"}}"#;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -64,11 +66,9 @@ async fn executable_serves_signed_transform_on_real_listener() {
         .unwrap();
     assert!(response.status().is_success());
     let json: serde_json::Value = response.json().await.unwrap();
-    assert!(
-        json["content"]
-            .as_str()
-            .unwrap()
-            .contains("actual executable")
+    assert_eq!(
+        json["content"],
+        "📱 **New SMS from x**\nactual executable\n-# now"
     );
     #[cfg(unix)]
     {
@@ -83,6 +83,21 @@ async fn executable_serves_signed_transform_on_real_listener() {
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {
                 assert!(status.success());
+                use std::io::Read;
+                let mut logs = String::new();
+                child
+                    .0
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut logs)
+                    .unwrap();
+                assert!(logs.contains("event=\"startup\""), "{logs}");
+                assert!(logs.contains("mode=\"transform\""), "{logs}");
+                assert!(logs.contains("event=\"shutdown\""), "{logs}");
+                assert!(!logs.contains("actual executable"));
+                assert!(!logs.contains("test-key"));
+                assert!(!logs.contains('\u{1b}'));
                 break;
             }
             assert!(start.elapsed() < std::time::Duration::from_secs(3));
@@ -107,6 +122,7 @@ fn rejects_missing_empty_or_invalid_configuration_without_exposing_values() {
     for (key, url, bind) in cases {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sms-discord-relay"));
         command
+            .env("RUST_LOG", "trace")
             .env_remove("SMS_GATEWAY_SIGNING_KEY")
             .env_remove("DISCORD_WEBHOOK_URL")
             .env_remove("BIND_ADDR");
@@ -122,6 +138,9 @@ fn rejects_missing_empty_or_invalid_configuration_without_exposing_values() {
         let output = command.output().unwrap();
         assert!(!output.status.success());
         let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("event=\"startup_failure\""), "{stderr}");
+        assert!(stderr.contains("reason="), "{stderr}");
+        assert!(!stderr.contains("bad-address"));
         assert!(!stderr.contains("secret-signing-key"));
         assert!(!stderr.contains("private-token"));
         assert!(!stderr.contains("evil.test"));

@@ -21,6 +21,7 @@ The binary reads environment variables, **not** `.env` automatically:
 | `SMS_GATEWAY_SIGNING_KEY` | Required nonempty text key from Android **Settings → Webhooks → Signing Key**. No insecure default; whitespace-only keys are rejected. Key bytes are used as entered, not hex/base64-decoded. |
 | `DISCORD_WEBHOOK_URL` | Optional; omit entirely for transform-only use. If set, must be `https://discord.com/api/webhooks/<numeric-id>/<token>`, optionally `?thread_id=<numeric-id>`. No other query arguments, fragments, credentials, alternate hosts, or non-443 ports. Blank is invalid. The relay adds `wait=true`. |
 | `BIND_ADDR` | Numeric socket address; defaults to `0.0.0.0:8080`. Use `127.0.0.1:8080` behind a same-host reverse proxy. |
+| `RUST_LOG` | Optional application log filter; default `info`. Use `off` to disable or `sms_discord_relay=debug` for health probes. Dependency targets are always blocked, even with `trace` or `reqwest=trace`. |
 
 `GET /healthz` returns `200 ok`. It is a liveness probe, not a Discord connectivity/readiness test. SIGINT/SIGTERM stop accepting connections and gracefully finish active requests.
 
@@ -37,7 +38,7 @@ podman run --rm --detach --name sms-discord-relay \
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
-For a published release, substitute `ghcr.io/lucination/sms-discord-relay:v0.1.0` for the local image. Version tags `vX.Y.Z` publish version-tagged and `latest` GHCR images, plus GitHub Release artifacts: static Linux amd64 and arm64 binaries, per-architecture Docker-compatible image archives, and `SHA256SUMS`. These are release outputs, not a production deployment. Pin a version/digest instead of `latest` for unattended production use. The executable inside the container is `/sms-discord-relay` and the exposed port is 8080.
+For a published release, substitute `ghcr.io/lucination/sms-discord-relay:v0.1.1` for the local image. Version tags `vX.Y.Z` publish version-tagged and `latest` GHCR images, plus GitHub Release artifacts: static Linux amd64 and arm64 binaries, per-architecture Docker-compatible image archives, and `SHA256SUMS`. These are release outputs, not a production deployment. Pin a version/digest instead of `latest` for unattended production use. The executable inside the container is `/sms-discord-relay` and the exposed port is 8080.
 
 ## Android setup
 
@@ -90,7 +91,7 @@ Example input:
 }
 ```
 
-`sender`, `message`, and `receivedAt` are required strings. Legacy `phoneNumber` is accepted as an alias for `sender`; supplying both is rejected as ambiguous. `recipient` and `simNumber` may be omitted or null. SIM numbers must be unsigned 32-bit integers. Envelope IDs, device IDs, webhook IDs, and message IDs are not required or retained. Extra fields are ignored. The received timestamp is displayed as supplied, not normalized.
+`sender` and legacy `phoneNumber` are separate optional strings. Both may be present: `sender` takes precedence; missing/null `sender` falls back to `phoneNumber`. If both are missing/null the payload returns `400`; a present empty sender displays `unknown sender`. Missing/null/empty `receivedAt` omits the footer. Missing `message` defaults to empty text; a non-string or explicitly null message returns `400`. Current gateway deliveries containing both fields are accepted. `recipient` and `simNumber` may be omitted or null. SIM numbers must be unsigned 32-bit integers. Envelope IDs, device IDs, webhook IDs, and message IDs are not required or retained. Extra fields are ignored. The received timestamp is displayed as supplied, not normalized.
 
 ### `POST /transform`
 
@@ -98,7 +99,7 @@ Single events return `200` with one Discord webhook payload:
 
 ```json
 {
-  "content": "From: +15555550123\nSIM: 1\nReceived: 2024-06-22T15:46:11.000+07:00\n\nHello from Android",
+  "content": "📱 **New SMS from +155****0123**\nHello from Android\n-# 2024-06-22T15:46:11.000+07:00",
   "allowed_mentions": {"parse": []}
 }
 ```
@@ -111,7 +112,7 @@ Forwards single messages, or each batch message sequentially in input order. Ret
 
 For both routes, authenticated other events (including data SMS, MMS, outbound status events, and ping) are safely ignored with `204`. Malformed JSON/supported payloads return `400`. Limits are **256 KiB raw body**, **100 messages per batch**, **32 active requests**, **3s connect timeout**, **8s per Discord request**, and **25s total request budget** (including incoming body read and the entire batch). Overflow returns `413`, not a partial batch. Work is not queued when capacity is exhausted. Proxy/header/connection limits should also be configured; the application semaphore limits active handlers, not all TCP connections.
 
-Sender, recipient, receive time, and optional SIM labels precede the SMS text. Each potentially large metadata field is capped at 160 UTF-16 units to leave room for the message. Final content, including labels and truncation marker, is capped at **2000 UTF-16 units**, without splitting a Unicode scalar. Truncation uses `…`. `allowed_mentions.parse=[]` prevents user/role/everyone pings; text still uses Discord's normal Markdown rendering.
+Formatting matches the original Python relay's visual layout: `📱 **New SMS from <sender>**`, newline, message, and an optional newline `-# <receivedAt>` footer. Recipient and SIM are not displayed. The supplied timestamp is unchanged. Reference: [Python app.py at revision fdc4956a542d88d69de10f71086acc3e83ae2ee1](https://github.com/lucination/sms-discord-relay-py/blob/fdc4956a542d88d69de10f71086acc3e83ae2ee1/app.py) (verified through the authenticated GitHub contents API; the public raw URL returned 404). Deliberate safety differences remain: final whole content is capped at **2000 UTF-16 units** without splitting a Unicode scalar, with `…` on truncation, and `allowed_mentions.parse=[]` prevents user/role/everyone pings. Text still uses Discord's normal Markdown rendering.
 
 ## Delivery and security limitations
 
@@ -119,7 +120,7 @@ Sender, recipient, receive time, and optional SIM labels precede the SMS text. E
 - The ±300s timestamp check narrows replay exposure but does **not** prevent replay within that window. There is no event-ID cache. Retries must carry a fresh valid signing timestamp; a replay of an old signed request is rejected after five minutes.
 - One shared signing key authenticates the sender; it does not enforce device-ID or webhook-ID allowlists. Use a dedicated registration/key/server if you need isolation.
 - Incoming TLS is your proxy's responsibility. Outgoing requests are HTTPS-only to the validated Discord host, use rustls, reject redirects, disable environment proxies and automatic retries. Local HTTP mock targets exist only in compiled test code; no environment bypass exists.
-- Only static startup failure messages go to stderr; there are no request, URL, token, key, or SMS logs. HTTP failure responses are empty or framework-generated generic body-limit errors, without incoming/upstream contents. Review any added proxy/observability configuration separately.
+- Structured plain key=value tracing goes to stderr, with no ANSI or file appender. Startup/shutdown, static startup-failure reasons, request route enums/status/elapsed/outcome, and outbound status/total/completed/reason enums are observable. Successful forwarding is info; failed status/transport is warn. Health probes are debug. Requests have spans; actual paths/queries, signing headers, config values/credentials, SMS sender/recipient/content, upstream bodies, and raw client errors are never logged. A hard application-target allowlist intersects `RUST_LOG`, including bridged `log` events; reqwest/hyper/wire targets cannot be enabled. HTTP failure responses remain generic. Review proxy logging separately.
 - Discord receives private SMS content, potentially including OTPs. Restrict channel access, secure env-file permissions and host access, and rotate both credentials when needed. Never commit `.env`.
 
 ## Verification

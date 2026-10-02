@@ -46,14 +46,14 @@ jobs:
           curl --fail --silent http://127.0.0.1:8080/healthz
           python3 - <<'PY'
           import hashlib, hmac, json, time, urllib.request
-          body = json.dumps({"event": "sms:received", "payload": {"messageId": "ci", "sender": "+15555550100", "message": "Container smoke test @everyone", "receivedAt": "2026-01-01T00:00:00Z"}}).encode()
+          body = json.dumps({"event": "sms:received", "deviceId": "device", "id": "delivery", "webhookId": "hook", "scheme": "https", "payload": {"messageId": "ci", "sender": "ci-sender", "phoneNumber": "legacy", "recipient": None, "simNumber": 1, "message": "Container smoke test @everyone", "receivedAt": "2026-01-01T00:00:00Z"}}).encode()
           timestamp = str(int(time.time()))
           signature = hmac.new(b"ci-test-key", body + timestamp.encode(), hashlib.sha256).hexdigest()
           request = urllib.request.Request("http://127.0.0.1:8080/transform", data=body, headers={"Content-Type": "application/json", "X-Timestamp": timestamp, "X-Signature": signature})
           with urllib.request.urlopen(request) as response:
               payload = json.load(response)
           assert payload["allowed_mentions"]["parse"] == []
-          assert "Container smoke test" in payload["content"]
+          assert payload["content"] == "📱 **New SMS from ci-sender**\nContainer smoke test @everyone\n-# 2026-01-01T00:00:00Z"
           PY
 
   release-build:

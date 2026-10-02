@@ -104,12 +104,28 @@ jobs:
             --label "org.opencontainers.image.source=https://github.com/$REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.version=$RELEASE_TAG" \
-            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=false" \
             --metadata-file image-metadata.json .
           digest=$(jq -er '.["containerimage.digest"]' image-metadata.json)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf '%s\n' "$digest" > "dist/image-digest-$ARCH.txt"
+          # Docker media types preserve healthcheck behavior in Docker AND Podman.
+          docker buildx imagetools inspect --raw "$IMAGE@$digest" | \
+            jq -e '.mediaType == "application/vnd.docker.distribution.manifest.v2+json"'
           docker pull "$IMAGE@$digest"
+          docker image inspect "$IMAGE@$digest" | \
+            jq -e '.[0].Config.Healthcheck.Test == ["CMD", "/sms-discord-relay", "--healthcheck"]'
+          probe_container=$(docker run -d --health-interval=1s --health-start-period=1s \
+            -e SMS_GATEWAY_SIGNING_KEY=ci-test-key "$IMAGE@$digest")
+          trap 'docker rm -f "$probe_container" >/dev/null' EXIT
+          for attempt in $(seq 1 20); do
+            health=$(docker inspect --format '{{.State.Health.Status}}' "$probe_container")
+            if [ "$health" = healthy ]; then break; fi
+            sleep 1
+          done
+          test "$health" = healthy
+          docker rm -f "$probe_container"
+          trap - EXIT
           # The archive uses the shared tag locally; no per-architecture tag is pushed.
           docker tag "$IMAGE@$digest" "$IMAGE:$RELEASE_TAG"
           docker save "$IMAGE:$RELEASE_TAG" | gzip -9 > "dist/sms-discord-relay-linux-$ARCH-container.tar.gz"

@@ -93,3 +93,9 @@ Final local verification on 0.1.2:
 - Actual optimized release executable smoke: local HTTP 200 → exit 0, HTTP 204 → exit 1, IPv4 wildcard → loopback success, IPv6 wildcard → loopback success; each sent exactly one `GET /healthz`, with stdout/stderr empty under `RUST_LOG=trace` and invalid Discord URL.
 
 Cargo package and lockfile are 0.1.2; dependency versions are unchanged. README documents the binary mode, exec healthcheck timing, Podman manual checks/inspection and Docker-format image builds, liveness vs readiness, no implicit unhealthy restart, and shared major/minor/exact/latest multiarch release aliases. No commit, push, deployment, external Discord request, Containerfile edit, or CI edit was performed by this subagent; container/CI verification belongs to the parent agent.
+
+## 0.1.3 registry healthcheck compatibility correction
+
+Parent verification of the published 0.1.2 image reproduced a real failure: `podman healthcheck run` returned "has no defined healthcheck", and both downloaded architecture archives inspected with null healthcheck metadata. Raw GHCR inspection found the configured Healthcheck in the image JSON, but OCI platform manifests caused Podman to ignore it. Native test jobs had used Docker builds, so did not exercise this export path.
+
+Corrective change: explicitly export platform images with `oci-mediatypes=false`, keep digest-only pushes/shared semver tags, and assert the Docker platform manifest media type plus expected healthcheck configuration in release CI. Each native release job now pulls the actual pushed digest and runs it until healthy before exporting the archive or publishing shared aliases. Original Rust behavior and dependencies are unchanged; package/lockfile/container label bumped to 0.1.3 rather than replacing the published 0.1.2 exact tag. Local Rust suite: 44 passed. Registry and archive verification must be repeated on 0.1.3 before claiming the correction succeeded.

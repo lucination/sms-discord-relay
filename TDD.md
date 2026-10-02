@@ -64,3 +64,32 @@ The user reported that current phone deliveries contain both `sender` and `phone
 A separate RED test (`rejects_missing_sender_fields_in_single_and_batch`) observed accepted sender-less payloads before implementing the user-requested `400` when both sender fields are absent/null. This intentionally supersedes the earlier missing/null-sender defaults above; a present empty string still renders `unknown sender`. Invalid batch messages are rejected before any forwarding.
 
 Final corrected local gates: 25 library + 4 integration tests passed; fmt, all-target clippy, and release build passed.
+
+## 0.1.2 existing-binary healthcheck
+
+These vertical slices were written and exercised separately, each reaching GREEN before the next behavior was introduced. RED observations below are actual local `cargo test --locked` output, not hypothetical failures.
+
+| Slice | Observed RED | Observed GREEN |
+| --- | --- | --- |
+| Actual executable healthcheck without credentials/logging | `healthcheck_succeeds_without_credentials_or_logging ... FAILED`: stderr contained `startup_failure` / missing signing key | Passed after dispatching the probe before configuration and logging; exactly `GET /healthz`, exit 0, empty streams, invalid Discord URL ignored |
+| Only HTTP 200 succeeds | `only_http_200_is_healthy ... FAILED`: 204 returned `Some(0)` instead of `Some(1)` | Passed with exact `StatusCode::OK`; local 204 and 500 both fail |
+| Do not follow redirects | `redirects_are_not_followed ... FAILED`: 302 followed to 200 and exited `Some(0)` | Passed with redirects disabled; listener records only one request |
+| Ignore environment proxies | `environment_proxy_cannot_report_false_health ... FAILED`: local proxy's 200 masked the closed target, exit `Some(0)` | Passed with `.no_proxy()`; exit 1, no proxy connection |
+| Bounded stalled response | `stalled_headers_fail_within_two_second_budget ... FAILED`: elapsed `2.60867299s`, exceeding 2.4s assertion | Passed with 1s connect / 2s total timeout; stalled response takes 1.8–2.4s including executable startup, under container's 3s timeout |
+| Numeric socket addresses only | `hostnames_are_rejected_before_network_access ... FAILED`: `localhost` accepted, exit `Some(0)` | Passed after parsing `SocketAddr`; rejected before any request |
+| Wildcard address mapping | `wildcard_addresses_use_matching_loopback_family_and_preserve_port ... FAILED`: `0.0.0.0:8080` instead of `127.0.0.1:8080` | Passed for IPv4/IPv6 wildcards and explicit-address/port preservation |
+| Reject port zero | `invalid_addresses_and_zero_ports_are_rejected ... FAILED`: `accepted 127.0.0.1:0` | Passed for IPv4/IPv6 zero ports and malformed addresses |
+| Default bind address | `absent_bind_defaults_to_ipv4_loopback_port_8080 ... FAILED`: unwrap of `Err(())` | Passed with absent `BIND_ADDR` defaulting to wildcard IPv4 port 8080, then mapped to loopback |
+| Reject unsupported CLI arguments quietly | `unsupported_arguments_fail_quietly_without_starting_server ... FAILED`: stderr startup/signing-key failure | Passed: unknown, extra, duplicate, and unsafe HTTP flag all exit 1 before logging/configuration |
+
+Additional regression coverage (these already passed on their first run, and are not claimed as RED slices): a closed listener, dropped connection with exactly one attempt, malformed/non-Unicode BIND_ADDR, non-Unicode credential environment ignored by a successful probe, and actual IPv4/IPv6 wildcard/exact local connections. Reqwest's no-retry policy is set explicitly rather than depending on its current defaults. The private binary-only healthcheck module separates pure address construction from HTTP/environment effects; existing library/server/logging code is untouched. No dependency was added.
+
+Final local verification on 0.1.2:
+
+- `cargo test --locked`: **44 tests passed** — all original **25 library + 4 executable integration** tests, plus **3 address unit + 12 healthcheck executable integration** tests.
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed. Initial clippy caught unchecked read counts in test servers and test-module ordering; those were corrected before the final run.
+- `cargo build --locked --release`: passed.
+- Actual optimized release executable smoke: local HTTP 200 → exit 0, HTTP 204 → exit 1, IPv4 wildcard → loopback success, IPv6 wildcard → loopback success; each sent exactly one `GET /healthz`, with stdout/stderr empty under `RUST_LOG=trace` and invalid Discord URL.
+
+Cargo package and lockfile are 0.1.2; dependency versions are unchanged. README documents the binary mode, exec healthcheck timing, Podman manual checks/inspection and Docker-format image builds, liveness vs readiness, no implicit unhealthy restart, and shared major/minor/exact/latest multiarch release aliases. No commit, push, deployment, external Discord request, Containerfile edit, or CI edit was performed by this subagent; container/CI verification belongs to the parent agent.

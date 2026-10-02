@@ -44,6 +44,17 @@ jobs:
             sleep 1
           done
           curl --fail --silent http://127.0.0.1:8080/healthz
+          docker exec relay-test /sms-discord-relay --healthcheck
+          for attempt in $(seq 1 40); do
+            health=$(docker inspect --format '{{.State.Health.Status}}' relay-test)
+            if [ "$health" = healthy ]; then break; fi
+            sleep 1
+          done
+          test "$health" = healthy
+          # A probe against an unused port must fail, not report healthy.
+          if docker exec -e BIND_ADDR=127.0.0.1:1 relay-test /sms-discord-relay --healthcheck; then
+            printf 'Healthcheck falsely succeeded on an unused port\n'; exit 1
+          fi
           python3 - <<'PY'
           import hashlib, hmac, json, time, urllib.request
           body = json.dumps({"event": "sms:received", "deviceId": "device", "id": "delivery", "webhookId": "hook", "scheme": "https", "payload": {"messageId": "ci", "sender": "ci-sender", "phoneNumber": "legacy", "recipient": None, "simNumber": 1, "message": "Container smoke test @everyone", "receivedAt": "2026-01-01T00:00:00Z"}}).encode()
@@ -74,6 +85,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Build native image and release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -87,15 +99,21 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'Expected stable semver tag vX.Y.Z\n'; exit 1; }
           IMAGE="ghcr.io/${REPOSITORY,,}"
           printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-          docker build -f Containerfile \
+          mkdir -p dist
+          docker buildx build -f Containerfile --platform "linux/$ARCH" --provenance=false \
             --label "org.opencontainers.image.source=https://github.com/$REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.version=$RELEASE_TAG" \
-            -t "$IMAGE:$RELEASE_TAG-$ARCH" .
-          docker push "$IMAGE:$RELEASE_TAG-$ARCH"
-          mkdir -p dist
-          docker save "$IMAGE:$RELEASE_TAG-$ARCH" | gzip -9 > "dist/sms-discord-relay-linux-$ARCH-container.tar.gz"
-          container=$(docker create "$IMAGE:$RELEASE_TAG-$ARCH")
+            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file image-metadata.json .
+          digest=$(jq -er '.["containerimage.digest"]' image-metadata.json)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "$digest" > "dist/image-digest-$ARCH.txt"
+          docker pull "$IMAGE@$digest"
+          # The archive uses the shared tag locally; no per-architecture tag is pushed.
+          docker tag "$IMAGE@$digest" "$IMAGE:$RELEASE_TAG"
+          docker save "$IMAGE:$RELEASE_TAG" | gzip -9 > "dist/sms-discord-relay-linux-$ARCH-container.tar.gz"
+          container=$(docker create "$IMAGE:$RELEASE_TAG")
           trap 'docker rm "$container" >/dev/null' EXIT
           docker cp "$container:/sms-discord-relay" "dist/sms-discord-relay-linux-$ARCH"
           chmod +x "dist/sms-discord-relay-linux-$ARCH"
@@ -133,8 +151,15 @@ jobs:
           set -euo pipefail
           IMAGE="ghcr.io/${REPOSITORY,,}"
           printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-          docker buildx imagetools create -t "$IMAGE:$RELEASE_TAG" -t "$IMAGE:latest" \
-            "$IMAGE:$RELEASE_TAG-amd64" "$IMAGE:$RELEASE_TAG-arm64"
+          digest_amd64=$(<dist/image-digest-amd64.txt)
+          digest_arm64=$(<dist/image-digest-arm64.txt)
+          [[ "$digest_amd64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$digest_arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          major_tag=${RELEASE_TAG%%.*}
+          minor_tag=${RELEASE_TAG%.*}
+          docker buildx imagetools create \
+            -t "$IMAGE:$RELEASE_TAG" -t "$IMAGE:$minor_tag" -t "$IMAGE:$major_tag" -t "$IMAGE:latest" \
+            "$IMAGE@$digest_amd64" "$IMAGE@$digest_arm64"
           docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG"
           (cd dist && sha256sum sms-discord-relay-linux-amd64 sms-discord-relay-linux-arm64 *-container.tar.gz > SHA256SUMS)
           printf 'Container: `%s:%s` (Linux amd64 and arm64).\n\nContainer archives load with `docker load` or `podman load`. Binaries are static musl; mark downloaded binaries executable with `chmod +x`. Runtime secrets are supplied separately.\n' "$IMAGE" "$RELEASE_TAG" > dist/release-notes.md

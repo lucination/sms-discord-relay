@@ -9,11 +9,12 @@ COPY src ./src
 RUN cargo build --locked --release
 
 FROM scratch
-ARG VERSION=0.1.1
+ARG VERSION=0.1.2
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="sms-discord-relay"       org.opencontainers.image.description="Authenticated Android SMS Gateway to Discord webhook relay"       org.opencontainers.image.source="https://github.com/lucination/sms-discord-relay"       org.opencontainers.image.version="${VERSION}"       org.opencontainers.image.revision="${REVISION}"
 COPY --from=build /build/target/release/sms-discord-relay /sms-discord-relay
 USER 65532:65532
 ENV BIND_ADDR=0.0.0.0:8080
 EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 CMD ["/sms-discord-relay", "--healthcheck"]
 ENTRYPOINT ["/sms-discord-relay"]

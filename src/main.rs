@@ -1,3 +1,5 @@
+mod healthcheck;
+
 use sms_discord_relay::{
     SigningKey,
     server::{App, DiscordTarget},
@@ -57,6 +59,16 @@ async fn shutdown() {
 }
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args_os().skip(1).eq(["--healthcheck"]) {
+        return if healthcheck::run().await.is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    if std::env::args_os().len() != 1 {
+        return ExitCode::FAILURE;
+    }
     sms_discord_relay::logging::init();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,

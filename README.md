@@ -25,12 +25,22 @@ The binary reads environment variables, **not** `.env` automatically:
 
 `GET /healthz` returns `200 ok`. It is a liveness probe, not a Discord connectivity/readiness test. SIGINT/SIGTERM stop accepting connections and gracefully finish active requests.
 
+### Executable healthcheck
+
+```sh
+BIND_ADDR=127.0.0.1:8080 ./target/release/sms-discord-relay --healthcheck
+```
+
+With no arguments the executable runs the server as before. With exactly `--healthcheck` it probes the existing server, without loading the signing key or Discord URL, constructing the relay, or initializing logging. It reads only `BIND_ADDR` (default `0.0.0.0:8080`); numeric explicit IPv4/IPv6 addresses and ports are preserved, while `0.0.0.0` maps to `127.0.0.1` and `[::]` to `[::1]`. Hostnames, malformed addresses, and port zero are rejected. The probe sends only `GET http://<address>/healthz`, disables proxies, redirects, and automatic retries, and uses a **1s connect / 2s total request timeout**. Only HTTP **200** exits **0**; other statuses, connection failures, timeouts, and invalid configuration exit **1**. Both stdout and stderr remain empty, even with `RUST_LOG=trace`. Unknown or extra CLI arguments also exit 1 quietly.
+
+This checks HTTP **liveness**, not webhook authentication, Discord availability, or delivery readiness; a configured or reachable Discord webhook is not needed.
+
 ### Container (Linux amd64 and arm64)
 
 The multi-stage `Containerfile` uses a digest-pinned, multi-architecture Rust/Alpine builder to produce a native static musl binary, then runs it as UID/GID 65532 in **`scratch`**. The runtime image contains only `/sms-discord-relay`: no Alpine userspace, shell, package manager, OpenSSL, or CA-file package. Rustls uses embedded WebPKI trust roots. CI builds and tests on native amd64 and arm64 runners (no emulation). `RUST_IMAGE` can override the builder; update its default digest deliberately when upgrading the toolchain. Local builds default to your host architecture; cross-architecture builds need emulation:
 
 ```sh
-podman build -f Containerfile -t sms-discord-relay:local .
+podman build --format docker -f Containerfile -t sms-discord-relay:local .
 podman run --rm --detach --name sms-discord-relay \
   --env-file .env -p 127.0.0.1:8080:8080 \
   --read-only --cap-drop=ALL --security-opt=no-new-privileges \
@@ -38,7 +48,23 @@ podman run --rm --detach --name sms-discord-relay \
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
-For a published release, substitute `ghcr.io/lucination/sms-discord-relay:v0.1.1` for the local image. Version tags `vX.Y.Z` publish version-tagged and `latest` GHCR images, plus GitHub Release artifacts: static Linux amd64 and arm64 binaries, per-architecture Docker-compatible image archives, and `SHA256SUMS`. These are release outputs, not a production deployment. Pin a version/digest instead of `latest` for unattended production use. The executable inside the container is `/sms-discord-relay` and the exposed port is 8080.
+For a published release, substitute `ghcr.io/lucination/sms-discord-relay:v0.1.2` for the local image. Starting with 0.1.2, each release publishes one shared multi-architecture manifest under exact, minor, major, and `latest` aliases: for example **`v0.1.2`**, **`v0.1`**, **`v0`**, and **`latest`**. Docker/Podman automatically selects Linux amd64 or arm64 from the same tag; new releases do **not** publish architecture-suffixed registry tags. Earlier releases such as `v0.1.1` remain historical releases; this does not remove their old tags. Pin an exact patch version or digest for controlled upgrades; minor/major aliases and `latest` float to newer releases. In particular, `v0` is **not** a compatibility guarantee for pre-1.0 versions.
+
+GitHub Release downloads remain architecture-specific: static Linux amd64 and arm64 binaries, per-architecture Docker-compatible image archives, and `SHA256SUMS`. These are release outputs, not a production deployment. The executable inside the container is `/sms-discord-relay` and the exposed port is 8080.
+
+The image's exec-form healthcheck runs `/sms-discord-relay --healthcheck` every **30s**, with a **3s timeout**, **5s start period**, and **3 retries** before unhealthy. It needs no shell, curl, additional dependency, or credential beyond the running server's environment. The container timeout is longer than the probe's 2s request budget. Use `podman build --format docker` as above: Podman's OCI image format may omit Docker healthcheck metadata.
+
+```sh
+# Run the configured image healthcheck immediately:
+podman healthcheck run sms-discord-relay
+# Run just the binary probe manually (no shell in the runtime):
+podman exec sms-discord-relay /sms-discord-relay --healthcheck
+# Inspect the recorded health status and recent results:
+podman inspect --format '{{.State.Health.Status}}' sms-discord-relay
+podman inspect --format '{{json .State.Health}}' sms-discord-relay
+```
+
+A `healthy`/`unhealthy` status is observability, **not an automatic restart policy**. Restart on unhealthy requires separately configured runtime/orchestrator behavior; the image does not add it. This remains a liveness check, not Discord readiness.
 
 ## Android setup
 

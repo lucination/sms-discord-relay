@@ -1,0 +1,146 @@
+name: CI and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.98.0
+      - name: Quality gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+      - name: Build and smoke-test container
+        run: |
+          docker build -f Containerfile -t sms-discord-relay:test .
+          docker run -d --name relay-test -p 127.0.0.1:8080:8080 \
+            -e SMS_GATEWAY_SIGNING_KEY=ci-test-key sms-discord-relay:test
+          trap 'docker rm -f relay-test' EXIT
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent http://127.0.0.1:8080/healthz; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:8080/healthz
+          python3 - <<'PY'
+          import hashlib, hmac, json, time, urllib.request
+          body = json.dumps({"event": "sms:received", "payload": {"messageId": "ci", "sender": "+15555550100", "message": "Container smoke test @everyone", "receivedAt": "2026-01-01T00:00:00Z"}}).encode()
+          timestamp = str(int(time.time()))
+          signature = hmac.new(b"ci-test-key", body + timestamp.encode(), hashlib.sha256).hexdigest()
+          request = urllib.request.Request("http://127.0.0.1:8080/transform", data=body, headers={"Content-Type": "application/json", "X-Timestamp": timestamp, "X-Signature": signature})
+          with urllib.request.urlopen(request) as response:
+              payload = json.load(response)
+          assert payload["allowed_mentions"]["parse"] == []
+          assert "Container smoke test" in payload["content"]
+          PY
+
+  release-build:
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build native image and release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'Expected stable semver tag vX.Y.Z\n'; exit 1; }
+          IMAGE="ghcr.io/${REPOSITORY,,}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker build -f Containerfile \
+            --label "org.opencontainers.image.source=https://github.com/$REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$RELEASE_TAG" \
+            -t "$IMAGE:$RELEASE_TAG-$ARCH" .
+          docker push "$IMAGE:$RELEASE_TAG-$ARCH"
+          mkdir -p dist
+          docker save "$IMAGE:$RELEASE_TAG-$ARCH" | gzip -9 > "dist/sms-discord-relay-linux-$ARCH-container.tar.gz"
+          container=$(docker create "$IMAGE:$RELEASE_TAG-$ARCH")
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:/sms-discord-relay" "dist/sms-discord-relay-linux-$ARCH"
+          chmod +x "dist/sms-discord-relay-linux-$ARCH"
+          file "dist/sms-discord-relay-linux-$ARCH"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: release-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Publish multi-architecture manifest and GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${REPOSITORY,,}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker buildx imagetools create -t "$IMAGE:$RELEASE_TAG" -t "$IMAGE:latest" \
+            "$IMAGE:$RELEASE_TAG-amd64" "$IMAGE:$RELEASE_TAG-arm64"
+          docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG"
+          (cd dist && sha256sum sms-discord-relay-linux-amd64 sms-discord-relay-linux-arm64 *-container.tar.gz > SHA256SUMS)
+          printf 'Container: `%s:%s` (Linux amd64 and arm64).\n\nContainer archives load with `docker load` or `podman load`. Binaries are static musl; mark downloaded binaries executable with `chmod +x`. Runtime secrets are supplied separately.\n' "$IMAGE" "$RELEASE_TAG" > dist/release-notes.md
+          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/sms-discord-relay-linux-amd64 dist/sms-discord-relay-linux-arm64 dist/*-container.tar.gz dist/SHA256SUMS --repo "$REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/sms-discord-relay-linux-amd64 dist/sms-discord-relay-linux-arm64 dist/*-container.tar.gz dist/SHA256SUMS \
+              --repo "$REPOSITORY" --verify-tag --title "$RELEASE_TAG" --notes-file dist/release-notes.md
+          fi

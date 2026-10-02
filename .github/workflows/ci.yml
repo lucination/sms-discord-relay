@@ -128,7 +128,14 @@ jobs:
           trap - EXIT
           # The archive uses the shared tag locally; no per-architecture tag is pushed.
           docker tag "$IMAGE@$digest" "$IMAGE:$RELEASE_TAG"
-          docker save "$IMAGE:$RELEASE_TAG" | gzip -9 > "dist/sms-discord-relay-linux-$ARCH-container.tar.gz"
+          # Modern Docker save can emit OCI archives; explicitly export Docker tar format.
+          docker buildx build -f Containerfile --platform "linux/$ARCH" --provenance=false \
+            --label "org.opencontainers.image.source=https://github.com/$REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$RELEASE_TAG" \
+            -t "$IMAGE:$RELEASE_TAG" \
+            --output "type=docker,dest=dist/sms-discord-relay-linux-$ARCH-container.tar" .
+          gzip -9 "dist/sms-discord-relay-linux-$ARCH-container.tar"
           container=$(docker create "$IMAGE:$RELEASE_TAG")
           trap 'docker rm "$container" >/dev/null' EXIT
           docker cp "$container:/sms-discord-relay" "dist/sms-discord-relay-linux-$ARCH"

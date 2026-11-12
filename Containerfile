@@ -1,7 +1,7 @@
 # Pinned multi-architecture Rust/Alpine builder (amd64 and arm64).
-ARG RUST_IMAGE=docker.io/library/rust:alpine@sha256:a96ea6d18d4062e38f16cfbadd8b4541d622f2527dd0a5eca1fb36d301da4e88
+ARG RUST_IMAGE=docker.io/library/rust:alpine@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383
 FROM ${RUST_IMAGE} AS build
-RUN apk add --no-cache build-base
+RUN apk add --no-cache build-base cmake
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -9,7 +9,7 @@ COPY src ./src
 RUN cargo build --locked --release
 
 FROM scratch
-ARG VERSION=0.1.3
+ARG VERSION=0.1.4
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="sms-discord-relay"       org.opencontainers.image.description="Authenticated Android SMS Gateway to Discord webhook relay"       org.opencontainers.image.source="https://github.com/lucination/sms-discord-relay"       org.opencontainers.image.version="${VERSION}"       org.opencontainers.image.revision="${REVISION}"
 COPY --from=build /build/target/release/sms-discord-relay /sms-discord-relay

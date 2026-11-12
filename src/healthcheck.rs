@@ -23,6 +23,8 @@ pub async fn run() -> Result<(), ()> {
     };
     let address = target_address(bind.as_deref())?;
     let response = reqwest::Client::builder()
+        // This probe is HTTP-only and must not initialize platform CA trust.
+        .tls_certs_only([])
         .connect_timeout(Duration::from_secs(1))
         .timeout(Duration::from_secs(2))
         .no_proxy()

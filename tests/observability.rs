@@ -79,7 +79,7 @@ fn client() -> reqwest::Client {
         .unwrap()
 }
 fn signed(client: &reqwest::Client, url: String, body: &str) -> reqwest::RequestBuilder {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

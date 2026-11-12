@@ -23,7 +23,15 @@ pub struct App {
 }
 impl App {
     pub fn new(key: SigningKey, target: Option<DiscordTarget>) -> Result<Self, &'static str> {
+        // reqwest 0.13 defaults to platform trust. Keep the scratch image's
+        // embedded-only WebPKI roots, independent of CA files and environment.
+        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|root| reqwest::Certificate::from_der(root.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "HTTP client initialization failed")?;
         let client = reqwest::Client::builder()
+            .tls_certs_only(roots)
             .https_only(true)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -786,7 +794,7 @@ mod tests {
         TestServer { base, task }
     }
     fn signed(client: &reqwest::Client, url: String, body: &str) -> reqwest::RequestBuilder {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

@@ -46,7 +46,7 @@ async fn executable_serves_signed_transform_on_real_listener() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let body = r#"{"event":"sms:received","payload":{"sender":"x","phoneNumber":"legacy","message":"actual executable","receivedAt":"now"}}"#;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

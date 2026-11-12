@@ -26,7 +26,7 @@ impl SigningKey {
         if seconds.abs_diff(now) > 300 {
             return Err(AuthError);
         }
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.0).map_err(|_| AuthError)?;
         mac.update(body);
         mac.update(timestamp.as_bytes());
@@ -197,7 +197,7 @@ mod tests {
     }
     #[test]
     fn rejects_empty_key_and_expired_timestamp() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         assert!(SigningKey::new("").is_err());
         assert!(SigningKey::new("   ").is_err());
         let key = SigningKey::new("key").unwrap();
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn authenticates_exact_raw_bytes_then_timestamp() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let key = SigningKey::new("text-key").unwrap();
         let body = b"{  raw bytes }";
         let timestamp = "0001000";
